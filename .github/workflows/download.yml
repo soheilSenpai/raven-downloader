@@ -30,7 +30,8 @@ jobs:
       - name: 📦 نصب ابزارهای لازم
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full
+          sudo apt-get install -y -qq p7zip-full wget aria2 python3-pip
+          pip3 install requests --quiet
 
       - name: 🔍 استخراج نام فایل از لینک
         id: filename
@@ -43,7 +44,6 @@ jobs:
           
           RAW_NAME=$(basename "$CLEAN_URL" | tr -d '\r\n')
           
-          # اگر نام خالی بود از نام پیش‌فرض استفاده کن
           if [[ -z "$RAW_NAME" || "$RAW_NAME" == "/" ]]; then
             RAW_NAME="downloaded_file"
           fi
@@ -60,22 +60,136 @@ jobs:
           
           echo "📋 نام اصلی فایل: $RAW_NAME"
 
-      - name: ⬇️ دانلود فایل
+      - name: ⬇️ دانلود فایل (روش چندگانه)
         id: download
         run: |
           RAW_NAME="${{ steps.filename.outputs.raw_name }}"
+          URL="${{ github.event.inputs.file_url }}"
           
-          echo "⬇️ در حال دانلود فایل..."
-          curl -L --fail --retry 5 --retry-delay 5 \
-               --connect-timeout 20 --max-time 1200 \
-               -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-               -o "$RAW_NAME" \
-               "${{ github.event.inputs.file_url }}"
+          # استخراج دامنه
+          DOMAIN=$(echo "$URL" | awk -F/ '{printf "%s//%s", $1, $3}')
+          
+          echo "=============================================="
+          echo "🔗 لینک: $URL"
+          echo "🌐 دامنه: $DOMAIN"
+          echo "📄 نام فایل: $RAW_NAME"
+          echo "=============================================="
+          
+          download_success=false
+          
+          # روش ۱: Python requests (انعطاف‌پذیرترین)
+          echo "🟡 روش ۱: تلاش با Python requests..."
+          python3 << PYEOF
+          import requests
+          import sys
+          
+          url = "$URL"
+          output = "$RAW_NAME"
+          domain = "$DOMAIN"
+          
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              "Accept": "*/*",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Referer": f"{domain}/",
+              "Origin": domain,
+              "Connection": "keep-alive",
+              "Sec-Fetch-Dest": "empty",
+              "Sec-Fetch-Mode": "cors",
+              "Sec-Fetch-Site": "same-origin",
+          })
+          
+          try:
+              # First request to get cookies
+              r = session.get(url, allow_redirects=True, timeout=30, stream=True)
+              r.raise_for_status()
+              
+              total_size = 0
+              with open(output, 'wb') as f:
+                  for chunk in r.iter_content(chunk_size=8192):
+                      if chunk:
+                          f.write(chunk)
+                          total_size += len(chunk)
+              
+              print(f"✅ Python: دانلود موفق - {total_size} bytes")
+              sys.exit(0)
+          except Exception as e:
+              print(f"❌ Python: خطا - {e}")
+              sys.exit(1)
+          PYEOF
+          
+          if [[ $? -eq 0 ]] && [[ -f "$RAW_NAME" ]] && [[ $(stat -c %s "$RAW_NAME" 2>/dev/null || echo 0) -gt 1000 ]]; then
+            download_success=true
+          fi
+          
+          # روش ۲: curl با تنظیمات کامل
+          if [[ "$download_success" == "false" ]]; then
+            echo "🟡 روش ۲: تلاش با curl..."
+            rm -f "$RAW_NAME"
+            curl -v -L --fail --retry 5 --retry-delay 10 \
+                 --connect-timeout 30 --max-time 1200 \
+                 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                 -H "Accept: */*" \
+                 -H "Accept-Language: en-US,en;q=0.9" \
+                 -H "Referer: $DOMAIN/" \
+                 -H "Origin: $DOMAIN" \
+                 -H "Connection: keep-alive" \
+                 -H "Sec-Fetch-Dest: empty" \
+                 -H "Sec-Fetch-Mode: cors" \
+                 -H "Sec-Fetch-Site: same-origin" \
+                 -c cookies.txt -b cookies.txt \
+                 -o "$RAW_NAME" \
+                 "$URL" 2>&1 | tail -20
+            
+            if [[ -f "$RAW_NAME" ]] && [[ $(stat -c %s "$RAW_NAME" 2>/dev/null || echo 0) -gt 1000 ]]; then
+              download_success=true
+            fi
+          fi
+          
+          # روش ۳: aria2
+          if [[ "$download_success" == "false" ]]; then
+            echo "🟡 روش ۳: تلاش با aria2..."
+            rm -f "$RAW_NAME"
+            aria2c -x 4 -s 4 --retry-wait=10 --max-tries=5 \
+                   --timeout=30 --max-file-not-found=5 --allow-overwrite=true \
+                   --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                   --header="Referer: $DOMAIN/" \
+                   --header="Origin: $DOMAIN" \
+                   --out="$RAW_NAME" "$URL"
+            
+            if [[ -f "$RAW_NAME" ]] && [[ $(stat -c %s "$RAW_NAME" 2>/dev/null || echo 0) -gt 1000 ]]; then
+              download_success=true
+            fi
+          fi
+          
+          # روش ۴: wget
+          if [[ "$download_success" == "false" ]]; then
+            echo "🟡 روش ۴: تلاش با wget..."
+            rm -f "$RAW_NAME"
+            wget --tries=5 --timeout=30 --waitretry=10 \
+                 --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                 --referer="$DOMAIN/" \
+                 --header="Origin: $DOMAIN" \
+                 --keep-session-cookies --save-cookies cookies.txt --load-cookies cookies.txt \
+                 -O "$RAW_NAME" "$URL"
+            
+            if [[ -f "$RAW_NAME" ]] && [[ $(stat -c %s "$RAW_NAME" 2>/dev/null || echo 0) -gt 1000 ]]; then
+              download_success=true
+            fi
+          fi
+          
+          # بررسی نهایی
+          if [[ "$download_success" == "false" ]]; then
+            echo "❌ همه روش‌های دانلود شکست خوردند!"
+            echo "💡 نکته: ممکن است لینک نیاز به مرورگر واقعی داشته باشد."
+            echo "💡 لینک را در مرورگر تست کنید و لینک مستقیم (Direct URL) را از Network Tab استخراج کنید."
+            exit 1
+          fi
           
           SIZE=$(stat -c %s "$RAW_NAME" 2>/dev/null || echo "0")
           SIZE_MB=$(( SIZE / 1048576 ))
-          echo "✅ دانلود کامل شد: $RAW_NAME (${SIZE_MB}MB)"
-          
+          echo "✅ دانلود موفق: $RAW_NAME (${SIZE_MB}MB)"
           echo "size=$SIZE" >> $GITHUB_OUTPUT
 
       - name: 🏷️ تعیین نام نهایی فایل
@@ -100,65 +214,46 @@ jobs:
           
           echo "final_name=$FINAL_NAME" >> $GITHUB_OUTPUT
           echo "archive_base=$ARCHIVE_BASE" >> $GITHUB_OUTPUT
-          
-          echo "🏷️ نام نهایی فایل: $FINAL_NAME"
-          echo "📦 پیشوند آرشیو: $ARCHIVE_BASE"
 
       - name: ✏️ تغییر نام فایل
         run: |
           RAW_NAME="${{ steps.filename.outputs.raw_name }}"
           FINAL_NAME="${{ steps.naming.outputs.final_name }}"
           mv "$RAW_NAME" "$FINAL_NAME"
-          echo "✅ فایل به $FINAL_NAME تغییر نام یافت"
 
       - name: 🗜️ ساخت آرشیو
         run: |
           ARCHIVE_BASE="${{ steps.naming.outputs.archive_base }}"
           FINAL_NAME="${{ steps.naming.outputs.final_name }}"
           
-          echo "🗜️ در حال ساخت آرشیو (هر تکه ۹۵MB)..."
           7z a -mx=1 -v95m "${ARCHIVE_BASE}.7z" "$FINAL_NAME"
-          
-          echo "✅ آرشیو ساخته شد:"
-          ls -lh "${ARCHIVE_BASE}.7z"* 2>/dev/null || echo "هیچ فایلی ساخته نشد"
 
       - name: 📁 سازمان‌دهی فایل‌ها
         id: organize
         run: |
           ARCHIVE_BASE="${{ steps.naming.outputs.archive_base }}"
           
-          # شمارش تعداد تکه‌ها
           CHUNK_COUNT=$(ls "${ARCHIVE_BASE}.7z."* 2>/dev/null | wc -l)
           
-          # بررسی وجود فایل .7z بدون پسوند (فایل کوچک که فقط یک تکه دارد ولی با پسوند .001 ذخیره شده)
-          SINGLE_CHUNK_AS_001=false
           if [[ $CHUNK_COUNT -eq 1 ]] && [[ -f "${ARCHIVE_BASE}.7z.001" ]]; then
-            # فقط یک تکه است → تغییر نام به .7z ساده
             mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
-            echo "📄 فایل کوچک (تک‌تکه) → تغییر نام به ${ARCHIVE_BASE}.7z"
             echo "is_multi=false" >> $GITHUB_OUTPUT
           elif [[ $CHUNK_COUNT -gt 1 ]]; then
-            # چند تکه → ساخت پوشه و انتقال
             FOLDER_NAME="${ARCHIVE_BASE}"
-            # اگر پوشه‌ای با این نام وجود دارد (مثلاً از اجرای قبلی)، یک پسوند اضافه کن
             if [[ -d "$FOLDER_NAME" ]]; then
               FOLDER_NAME="${ARCHIVE_BASE}_files"
             fi
             mkdir -p "$FOLDER_NAME"
             mv "${ARCHIVE_BASE}.7z."* "$FOLDER_NAME/" 2>/dev/null || true
-            echo "📁 فایل‌های تکه‌تکه به پوشه $FOLDER_NAME/ منتقل شدند"
             echo "is_multi=true" >> $GITHUB_OUTPUT
             echo "folder=$FOLDER_NAME" >> $GITHUB_OUTPUT
           else
-            # فایل .7z ساده از قبل وجود دارد
-            echo "📄 فایل کوچک → در ریشه باقی می‌ماند"
             echo "is_multi=false" >> $GITHUB_OUTPUT
           fi
 
       - name: 🗑️ حذف فایل اصلی
         run: |
           rm -f "${{ steps.naming.outputs.final_name }}"
-          echo "✅ فایل اصلی حذف شد"
 
       - name: ⚙️ تنظیمات Git
         run: |
@@ -172,29 +267,16 @@ jobs:
           FOLDER="${{ steps.organize.outputs.folder }}"
           
           if [[ "$IS_MULTI" == "true" ]]; then
-            # اضافه کردن پوشه
             git add "$FOLDER/"
           else
-            # اضافه کردن تک فایل .7z
             git add "${ARCHIVE_BASE}.7z"
           fi
           
-          echo "📊 وضعیت staging:"
-          git status
-          
           if ! git diff --staged --quiet; then
             git commit -m "📦 Raven: ${ARCHIVE_BASE}"
-            echo "⬆️ در حال آپلود..."
-            if git push origin HEAD; then
-              echo "✅ آپلود موفقیت‌آمیز بود!"
-            else
-              echo "❌ خطا در آپلود. لطفاً دوباره تلاش کنید."
-              exit 1
-            fi
+            git push origin HEAD
           else
-            echo "⚠️ هیچ فایلی stage نشده است!"
-            echo "📁 محتویات پوشه:"
-            ls -la
+            echo "⚠️ هیچ فایلی stage نشده!"
             exit 1
           fi
 
@@ -204,13 +286,11 @@ jobs:
           FOLDER="${{ steps.organize.outputs.folder }}"
           IS_MULTI="${{ steps.organize.outputs.is_multi }}"
           
-          echo ""
           echo "=============================================="
           echo "🎉 عملیات با موفقیت انجام شد!"
           if [[ "$IS_MULTI" == "true" ]]; then
-            echo "📁 فایل‌ها در پوشه ${FOLDER}/ قرار دارند."
+            echo "📁 فایل‌ها در پوشه ${FOLDER}/"
           else
-            echo "📄 فایل در ریشه مخزن (${ARCHIVE_BASE}.7z) ذخیره شد."
+            echo "📄 فایل در ریشه مخزن (${ARCHIVE_BASE}.7z)"
           fi
-          echo "📥 حالا می‌توانید از صفحه اصلی مخزن دانلود کنید."
           echo "=============================================="
